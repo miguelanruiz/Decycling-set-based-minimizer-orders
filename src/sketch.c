@@ -8,13 +8,20 @@
 #include <cmath>
 #include <iostream>
 #include <fstream>
+#include <vector>
+#include <stdbool.h>
+#include <algorithm>
+
+using namespace std;
 
 /**
  * option to dump minimizers to file
  * use empty fasta/q read file when using this
  * NOTE: writing done to file "minimizer.txt" in append mode
  */
-#define WRITE_MINIMIZERS_TO_FILE 0
+#define WRITE_MINIMIZERS_TO_FILE 1
+
+#define K_VALUE 28
 
 unsigned char seq_nt4_table[256] = {
 	0, 1, 2, 3,  4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,
@@ -88,6 +95,16 @@ static inline double applyWeight(uint64_t kmer, const mm_idx_t *mi)
 	//we avoid adding one for better double precision 
 }
 
+double calculate_imaginary_part(uint64_t kmer, uint64_t twobit_mask, double weights[4][K_VALUE], int k) {
+      double shiftsum = 0.0;
+      kmer = kmer>>2;
+      for(int i = 0; i < k-1; i++) {
+        shiftsum += weights[kmer & twobit_mask][i];
+        kmer = kmer >> 2;
+      }
+      return shiftsum;
+}
+
 typedef struct { // a simplified version of kdq
 	int front, count;
 	int a[32];
@@ -106,6 +123,47 @@ static inline int tq_shift(tiny_queue_t *q)
 	q->front &= 0x1f;
 	--q->count;
 	return x;
+}
+
+bool lexicographical_compare(const char* a, const char* b, int length) {
+    for (int i = 0; i < length; ++i) {
+        if (a[i] < b[i]) return true;
+        else if (a[i] > b[i]) return false;
+    }
+    return false;
+}
+
+bool is_in_mds(uint64_t kmer, double weights[4][K_VALUE], int k, uint64_t twobit_mask) {
+    // Calcular la parte imaginaria de kmer
+    double I_x = calculate_imaginary_part(kmer, twobit_mask, weights, k);
+    
+    // Convertir kmer a un array de caracteres para las rotaciones
+    char kmer_array[K_VALUE];
+    for (int i = k - 1; i >= 0; --i) {
+        kmer_array[i] = 'A' + (kmer & twobit_mask); // Asume que twobit_mask extrae los nucleótidos
+        kmer >>= 2;
+    }
+    
+    // Realizar la rotación y comparación lexicográfica
+    if (I_x > 0) {
+        vector<char> rotated_kmer(kmer_array, kmer_array + k);
+        rotate(rotated_kmer.begin(), rotated_kmer.begin() + 1, rotated_kmer.end());
+        if (lexicographical_compare(kmer_array, kmer_array + k, rotated_kmer.begin(), rotated_kmer.end())) {
+            return false; // No es el mínimo lexicográfico
+        }
+        return true; // Es el mínimo lexicográfico
+    } else if (I_x == 0) {
+        // Comprobar todas las rotaciones para el ciclo I
+        for (int shift = 1; shift < k; ++shift) {
+            vector<char> rotated_kmer(kmer_array, kmer_array + k);
+            rotate(rotated_kmer.begin(), rotated_kmer.begin() + shift, rotated_kmer.end());
+            if (lexicographical_compare(rotated_kmer.begin(), rotated_kmer.end(), kmer_array, kmer_array + k)) {
+                return false; // Encontró una rotación menor lexicográficamente
+            }
+        }
+        return true; // kmer es el mínimo en su ciclo I
+    }
+    return false; // Si I_x < 0, no está en MDS
 }
 
 /**
@@ -131,13 +189,25 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 	std::ofstream outFile ("minimizers.txt", std::ofstream::out | std::ofstream::app);
 #endif
 
+	assert(len > 0 && (w > 0 && w < 256) && (k > 0 && k <= 28)); // 56 bits for k-mer; could use long k-mers, but 28 enough in practice
+
+	double weights[4][K_VALUE];
+	double u = 0.1; // define the value of u
+	uint64_t twobit_mask = uint64_t{3};
+
+	// initialize the weights array
+	for (int j = 0; j < 4; j++) {
+		for (int i = k - 1; i >= 0; i--) {
+			weights[j][i] = sin(i * u) * j; // Los pesos están en orden inverso
+		}
+	}
+
 	uint64_t shift1 = 2 * (k - 1), mask = (1ULL<<2*k) - 1, kmer[2] = {0,0};
 	int i, j, l, buf_pos, min_pos, kmer_span = 0;
 	mm128_t buf[256], min = { UINT64_MAX, UINT64_MAX };
 	double buf_order[256], min_order = 2.0;    //2.0 value is indicating uninitialized
 	tiny_queue_t tq;
 
-	assert(len > 0 && (w > 0 && w < 256) && (k > 0 && k <= 28)); // 56 bits for k-mer; could use long k-mers, but 28 enough in practice
 	memset(buf, 0xff, w * 16);
 	for(i=0; i<w; i++) buf_order[i] = 2.0;
 	memset(&tq, 0, sizeof(tiny_queue_t));
@@ -171,8 +241,17 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 				info.x = hash_val << 8 | kmer_span;
 				info.y = (uint64_t)rid<<32 | (uint32_t)i<<1 | z;
 				info_order = applyWeight(kmer[z], mi);
+
+				// Verifica si el k-mer actual es el minimizador y si no está en MDS
+				if (info_order < min_order && !is_in_mds(kmer[z], weights, k, twobit_mask)) {
+					// Si es el minimizador y no está en MDS, entonces actualiza el minimizador actual
+					min = info;
+					min_pos = buf_pos;
+					min_order = info_order;
+				}
 			}
 		} else l = 0, tq.count = tq.front = 0, kmer_span = 0;
+
 		buf[buf_pos] = info; // need to do this here as appropriate buf_pos and buf[buf_pos] are needed below
 		buf_order[buf_pos] = info_order;
 
